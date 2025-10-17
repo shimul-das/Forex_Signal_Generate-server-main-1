@@ -1,0 +1,648 @@
+#@title 1. Setup and Installations
+#@markdown Run this cell first to install the necessary libraries for the project.
+!pip install pymongo[srv] tensorflow scikit-learn joblib pandas pandas_ta
+
+#@markdown ---
+#@markdown After this cell runs, you **must upload your historical data file**.
+#@markdown 1. Click the **folder icon** on the left sidebar.
+#@markdown 2. Click the **"Upload to session storage"** button.
+#@markdown 3. Select and upload your `EURUSD_1_minute_1M.csv` file. 
+
+print("\nSetup complete. Please upload your CSV file now.")
+
+
+#@title 2. Train the LSTM Model with Indicators and Volume
+#@markdown This cell now calculates RSI, a 50-period Moving Average, and a 20-period
+#@markdown Volume Moving Average, including them as features for training.
+#@markdown
+#@markdown This process will take a significant amount of time.
+
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+import joblib
+import os
+
+# --- Configuration ---
+CSV_FILE_PATH = 'EURUSD_1_minute_1M.csv'
+MODEL_SAVE_PATH = 'eurusd_model.h5'
+SCALER_SAVE_PATH = 'scaler.pkl'
+SEQUENCE_LENGTH = 60
+TARGET_COLUMN_INDEX = 0 # 'Close' is the first column in our features list
+
+def train_forex_model():
+    """
+    Orchestrates the entire model training pipeline with indicators and volume.
+    """
+    if not os.path.exists(CSV_FILE_PATH):
+        print("="*50)
+        print(f"FATAL ERROR: The data file '{CSV_FILE_PATH}' was not found.")
+        print("Please make sure you have uploaded it before running this cell.")
+        print("="*50)
+        return
+
+    # --- Load and Preprocess Data ---
+    print("Loading data...")
+    try:
+        df = pd.read_csv(
+            CSV_FILE_PATH,
+            names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'],
+            header=None
+        )
+        print("Data loaded successfully.")
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+
+    df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+    df.set_index('Timestamp', inplace=True)
+    df.drop(['Date', 'Time', 'Open', 'High', 'Low'], axis=1, inplace=True)
+    df.sort_index(inplace=True)
+
+    # --- Calculate Indicators ---
+    print("Calculating RSI, Moving Average, and Volume SMA indicators...")
+    df.ta.rsi(length=14, append=True)
+    df.ta.sma(length=50, append=True)
+    df.ta.sma(close=df['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
+    df.ta.sma(close=df['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
+    df.dropna(inplace=True) # Remove rows with NaN values
+
+    FEATURES = ['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']
+    data = df[FEATURES].copy()
+
+    # --- Scaling Data ---
+    print("Scaling multi-feature data...")
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data)
+    joblib.dump(scaler, SCALER_SAVE_PATH)
+    print(f"Scaler for {len(FEATURES)} features saved to '{SCALER_SAVE_PATH}'")
+
+    # --- Create Sequences ---
+    print("Creating sequences from multi-feature data...")
+    X, y = [], []
+    for i in range(SEQUENCE_LENGTH, len(scaled_data)):
+        X.append(scaled_data[i-SEQUENCE_LENGTH:i]) # All feature columns
+        y.append(scaled_data[i, TARGET_COLUMN_INDEX]) # Only the 'Close' price column
+    X, y = np.array(X), np.array(y)
+
+    # --- Split Data ---
+    split_index = int(len(X) * 0.95)
+    X_train, X_test = X[:split_index], X[split_index:]
+    y_train, y_test = y[:split_index], y[split_index:]
+    print(f"Training data shape: {X_train.shape}") # Should be (samples, 60, 4)
+
+    # --- Build Model ---
+    print("Building LSTM model for multi-feature input...")
+    model = Sequential([
+        LSTM(units=100, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        Dropout(0.2),
+        LSTM(units=100, return_sequences=False),
+        Dropout(0.2),
+        Dense(units=25),
+        Dense(units=1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.summary()
+
+    # --- Train Model ---
+    print("\nStarting model training...")
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model_checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, save_best_only=True, monitor='val_loss')
+
+    model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=64,
+        validation_data=(X_test, y_test),
+        callbacks=[early_stopping, model_checkpoint]
+    )
+
+    print("\n--- Training Complete ---")
+    print(f"Model saved to '{MODEL_SAVE_PATH}'")
+    print(f"Scaler saved to '{SCALER_SAVE_PATH}'")
+    print("You can now proceed to the next step.")
+
+# Run the training process
+train_forex_model()
+
+
+#@title 3. Simulate Live Trading with RSI Triggers and Send Signals
+#@markdown This final cell simulates a live trading environment. It will:
+#@markdown 1. Loop through historical data as if it were a live feed.
+#@markdown 2. Wait for the RSI to cross above 30 (buy trigger) or below 70 (sell trigger).
+#@markdown 3. On a trigger, run the LSTM prediction.
+#@markdown 4. If the prediction aligns with trend and volume rules, log it to MongoDB.
+#@markdown
+#@markdown **Action Required:** You must paste your MongoDB Connection String (URI) below.
+
+import json
+from pymongo import MongoClient
+from datetime import datetime, timezone
+from tensorflow.keras.models import load_model
+
+# --- PASTE YOUR MONGODB URI HERE ---
+# It should look like: "mongodb+srv://<user>:<password>@cluster..."
+MONGO_URI = "" # IMPORTANT: Replace with your actual connection string
+
+# --- Configuration for Triggers and Dynamic TP/SL ---
+OVERSOLD_LEVEL = 30
+OVERBOUGHT_LEVEL = 70
+TP_SL_RATIO_PRED = 2.0
+RISK_PIPS_LOW_VOL = 8
+RISK_PIPS_NORMAL_VOL = 12
+RISK_PIPS_HIGH_VOL = 18
+SIMULATION_CANDLES = 2000 # How many recent candles to simulate
+
+def check_files_exist():
+    if not all(os.path.exists(p) for p in [MODEL_SAVE_PATH, SCALER_SAVE_PATH, CSV_FILE_PATH]):
+        print("ERROR: Model/scaler/CSV files not found. Please run previous steps successfully first.")
+        return False
+    return True
+
+def calculate_trade_parameters(last_row, predicted_price):
+    """
+    Calculates trade parameters and dynamically adjusts SL/TP based on volume.
+    This is called AFTER a prediction is made.
+    """
+    last_price = last_row['Close']
+    last_sma = last_row['SMA_50']
+    volume_short_sma = last_row['Volume_SMA_20']
+    volume_long_sma = last_row['Volume_SMA_50']
+    
+    direction = None
+    # Buy Signal Logic: Prediction is up AND price is above the 50-period trend line
+    if predicted_price > last_price and last_price > last_sma:
+        direction = 'buy'
+    # Sell Signal Logic: Prediction is down AND price is below the 50-period trend line
+    elif predicted_price < last_price and last_price < last_sma:
+        direction = 'sell'
+    else:
+        return None # Prediction does not align with the major trend
+
+    # --- Dynamic Risk Calculation based on Volume ---
+    risk_pips = RISK_PIPS_NORMAL_VOL
+    if volume_short_sma > (volume_long_sma * 1.5):
+        risk_pips = RISK_PIPS_HIGH_VOL
+    elif volume_short_sma < (volume_long_sma * 0.7):
+        risk_pips = RISK_PIPS_LOW_VOL
+
+    pip_value = 0.0001
+    sl_distance = risk_pips * pip_value
+    tp_distance = sl_distance * TP_SL_RATIO_PRED
+    entry_price = last_price
+    stop_loss = entry_price - sl_distance if direction == 'buy' else entry_price + sl_distance
+    take_profit = entry_price + tp_distance if direction == 'buy' else entry_price - tp_distance
+    
+    return {
+        "direction": direction,
+        "entry_price": round(entry_price, 5),
+        "take_profit": round(take_profit, 5),
+        "stop_loss": round(stop_loss, 5),
+        "predicted_price_raw": float(predicted_price),
+        "risk_pips": risk_pips,
+        "indicators": {
+            "rsi_14": round(last_row['RSI_14'], 2),
+            "sma_50": round(last_sma, 5),
+            "volume_sma_20": round(volume_short_sma, 2),
+            "volume_sma_50": round(volume_long_sma, 2)
+        }
+    }
+
+def run_live_simulation_and_log():
+    if not MONGO_URI:
+        print("ERROR: MONGO_URI is not set. Please paste your connection string.")
+        return
+    if not check_files_exist():
+        return
+
+    # --- Load Model, Scaler, and Prepare Data ---
+    try:
+        model = load_model(MODEL_SAVE_PATH)
+        scaler = joblib.load(SCALER_SAVE_PATH)
+        
+        df_full = pd.read_csv(CSV_FILE_PATH, names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'], header=None)
+        df_full['Timestamp'] = pd.to_datetime(df_full['Date'] + ' ' + df_full['Time'])
+        df_full.set_index('Timestamp', inplace=True)
+        df_full.ta.rsi(length=14, append=True)
+        df_full.ta.sma(length=50, append=True)
+        df_full.ta.sma(close=df_full['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
+        df_full.ta.sma(close=df_full['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
+        df_full.dropna(inplace=True)
+
+        print("Model, scaler, and full dataset loaded successfully.")
+    except Exception as e:
+        print(f"Error loading files or preparing data: {e}")
+        return
+
+    # --- Simulate Live Feed ---
+    print(f"\n--- Starting Live Simulation for the last {SIMULATION_CANDLES} candles ---")
+    simulation_df = df_full.tail(SIMULATION_CANDLES)
+    
+    for i in range(1, len(simulation_df)):
+        current_row = simulation_df.iloc[i]
+        previous_row = simulation_df.iloc[i-1]
+        
+        current_rsi = current_row['RSI_14']
+        previous_rsi = previous_row['RSI_14']
+        
+        trigger_type = None
+        # BUY TRIGGER: RSI crosses UP from the oversold line
+        if previous_rsi < OVERSOLD_LEVEL and current_rsi >= OVERSOLD_LEVEL:
+            trigger_type = 'buy'
+        # SELL TRIGGER: RSI crosses DOWN from the overbought line
+        elif previous_rsi > OVERBOUGHT_LEVEL and current_rsi <= OVERBOUGHT_LEVEL:
+            trigger_type = 'sell'
+            
+        if trigger_type:
+            print(f"\n[{current_row.name}] --- {trigger_type.upper()} TRIGGER DETECTED --- RSI: {current_rsi:.2f}")
+            
+            # --- Prepare sequence for prediction ---
+            start_index = i - SEQUENCE_LENGTH
+            end_index = i
+            if start_index < 0:
+                continue # Not enough data for a full sequence
+            
+            input_sequence_df = simulation_df.iloc[start_index:end_index]
+            input_features = input_sequence_df[['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']]
+            scaled_input = scaler.transform(input_features)
+            reshaped_input = np.reshape(scaled_input, (1, SEQUENCE_LENGTH, input_features.shape[1]))
+
+            # --- Make Prediction ---
+            print(f"[{current_row.name}] Running LSTM model prediction...")
+            prediction_scaled = model.predict(reshaped_input)
+            dummy_array = np.zeros((1, input_features.shape[1]))
+            dummy_array[0, TARGET_COLUMN_INDEX] = prediction_scaled[0, 0]
+            predicted_price = scaler.inverse_transform(dummy_array)[0, TARGET_COLUMN_INDEX]
+
+            # --- Check Signal Logic and Log to MongoDB ---
+            trade_params = calculate_trade_parameters(current_row, predicted_price)
+            
+            if trade_params:
+                print(f"[{current_row.name}] SUCCESS: Prediction aligns with trend. Logging signal to MongoDB.")
+                print(json.dumps(trade_params, indent=4))
+                
+                try:
+                    client = MongoClient(MONGO_URI)
+                    db = client.forex_signals_db
+                    signals_collection = db.signals
+                    signal_doc = {
+                        "symbol": "EURUSD",
+                        "timestamp": current_row.name.to_pydatetime().replace(tzinfo=timezone.utc),
+                        "status": "active",
+                        "trigger_type": trigger_type,
+                        **trade_params, # Unpack the trade params dictionary
+                        "source": "colab_notebook_v4_rsi_trigger"
+                    }
+                    signals_collection.insert_one(signal_doc)
+                    client.close()
+                except Exception as e:
+                    print(f"[{current_row.name}] MONGO ERROR: {e}")
+            else:
+                print(f"[{current_row.name}] INFO: Prediction did not align with trend. Signal rejected.")
+
+    print("\n--- Simulation Complete ---")
+
+# Run the live simulation and logging process
+run_live_simulation_and_log()
+
+-------------------------------------------------------update ta
+#@title 1. Setup and Installations
+#@markdown Run this cell first to install the necessary libraries for the project.
+!pip install pymongo[srv] tensorflow scikit-learn joblib pandas pandas_ta
+
+#@markdown ---
+#@markdown After this cell runs, you **must upload your historical data file**.
+#@markdown 1. Click the **folder icon** on the left sidebar.
+#@markdown 2. Click the **"Upload to session storage"** button.
+#@markdown 3. Select and upload your `EURUSD_1_minute_1M.csv` file. 
+
+print("\nSetup complete. Please upload your CSV file now.")
+
+#@title 2. Train the LSTM Model (Corrected for Missing Header)
+#@markdown This version correctly handles CSV files that have no header row.
+#@markdown This process will take a significant amount of time.
+
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+import joblib
+import os
+
+# --- Configuration ---
+CSV_FILE_PATH = '/content/EURUSD1.csv'
+MODEL_SAVE_PATH = 'eurusd_model.h5'
+SCALER_SAVE_PATH = 'scaler.pkl'
+SEQUENCE_LENGTH = 60
+TARGET_COLUMN_INDEX = 0 # 'Close' is the first column in our features list
+
+def train_forex_model():
+    """
+    Orchestrates the entire model training pipeline with indicators and volume.
+    """
+    if not os.path.exists(CSV_FILE_PATH):
+        print("="*50)
+        print(f"FATAL ERROR: The data file '{CSV_FILE_PATH}' was not found.")
+        print("Please make sure you have uploaded it before running this cell.")
+        print("="*50)
+        return
+
+    # --- Load and Preprocess Data ---
+    print("Loading data...")
+    try:
+        # --- CHANGED: Updated to handle a file with NO header ---
+        df = pd.read_csv(
+            CSV_FILE_PATH,
+            header=None, # Tell pandas there is no header row in the file
+            names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'], # Manually provide the column names
+            sep=r'\s+',          # Use one or more spaces/tabs as the separator
+            engine='python'     # Use the python engine for more flexibility
+        )
+        print("Data loaded successfully.")
+        print("Columns have been set to:", df.columns.tolist())
+
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+
+    # Now that columns have the correct names, the rest of the script will work
+    try:
+        df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+        df.set_index('Timestamp', inplace=True)
+        # Drop the original Date/Time and OHLC columns, keeping Close and Volume
+        df.drop(['Date', 'Time', 'Open', 'High', 'Low'], axis=1, inplace=True, errors='ignore')
+        df.sort_index(inplace=True)
+    except Exception as e:
+        print(f"FATAL ERROR during data processing: {e}")
+        return
+
+
+    # --- Calculate Indicators ---
+    print("Calculating RSI, Moving Average, and Volume SMA indicators...")
+    df.ta.rsi(length=14, append=True)
+    df.ta.sma(length=50, append=True)
+    df.ta.sma(close=df['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
+    df.ta.sma(close=df['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
+    df.dropna(inplace=True) # Remove rows with NaN values
+
+    if df.empty:
+        print("="*50)
+        print("FATAL ERROR: The DataFrame is empty after calculating indicators.")
+        print("This is likely because your source CSV file has too few rows (less than 50).")
+        print("Please use a larger data file.")
+        print("="*50)
+        return
+
+    FEATURES = ['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']
+    data = df[FEATURES].copy()
+
+    # --- Scaling Data ---
+    print("Scaling multi-feature data...")
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data)
+    joblib.dump(scaler, SCALER_SAVE_PATH)
+    print(f"Scaler for {len(FEATURES)} features saved to '{SCALER_SAVE_PATH}'")
+
+    # --- Create Sequences ---
+    print("Creating sequences from multi-feature data...")
+    X, y = [], []
+    for i in range(SEQUENCE_LENGTH, len(scaled_data)):
+        X.append(scaled_data[i-SEQUENCE_LENGTH:i])
+        y.append(scaled_data[i, TARGET_COLUMN_INDEX])
+    X, y = np.array(X), np.array(y)
+    
+    if len(X) == 0:
+        print("="*50)
+        print("FATAL ERROR: Not enough data to create training sequences.")
+        print(f"You need at least {SEQUENCE_LENGTH + 50} rows of data after cleaning.")
+        print("Please use a much larger CSV file.")
+        print("="*50)
+        return
+
+    # --- Split Data ---
+    split_index = int(len(X) * 0.95)
+    X_train, X_test = X[:split_index], X[split_index:]
+    y_train, y_test = y[:split_index], y[split_index:]
+    print(f"Training data shape: {X_train.shape}")
+
+    # --- Build Model ---
+    print("Building LSTM model...")
+    model = Sequential([
+        LSTM(units=100, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        Dropout(0.2),
+        LSTM(units=100, return_sequences=False),
+        Dropout(0.2),
+        Dense(units=25),
+        Dense(units=1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.summary()
+
+    # --- Train Model ---
+    print("\nStarting model training...")
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model_checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, save_best_only=True, monitor='val_loss')
+
+    model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=64,
+        validation_data=(X_test, y_test),
+        callbacks=[early_stopping, model_checkpoint]
+    )
+
+    print("\n--- Training Complete ---")
+    print(f"Model saved to '{MODEL_SAVE_PATH}'")
+    print(f"Scaler saved to '{SCALER_SAVE_PATH}'")
+    print("You can now proceed to the next step.")
+
+# Run the training process
+train_forex_model()
+
+
+#@title 3. Simulate Live Trading with RSI Triggers and Send Signals
+#@markdown This final cell simulates a live trading environment. It will:
+#@markdown 1. Loop through historical data as if it were a live feed.
+#@markdown 2. Wait for the RSI to cross above 30 (buy trigger) or below 70 (sell trigger).
+#@markdown 3. On a trigger, run the LSTM prediction.
+#@markdown 4. If the prediction aligns with trend and volume rules, log it to MongoDB.
+#@markdown
+#@markdown **Action Required:** You must paste your MongoDB Connection String (URI) below.
+
+import json
+from pymongo import MongoClient
+from datetime import datetime, timezone
+from tensorflow.keras.models import load_model
+
+# --- PASTE YOUR MONGODB URI HERE ---
+# It should look like: "mongodb+srv://<user>:<password>@cluster..."
+MONGO_URI = "" # IMPORTANT: Replace with your actual connection string
+
+# --- Configuration for Triggers and Dynamic TP/SL ---
+OVERSOLD_LEVEL = 30
+OVERBOUGHT_LEVEL = 70
+TP_SL_RATIO_PRED = 2.0
+RISK_PIPS_LOW_VOL = 8
+RISK_PIPS_NORMAL_VOL = 12
+RISK_PIPS_HIGH_VOL = 18
+SIMULATION_CANDLES = 2000 # How many recent candles to simulate
+
+def check_files_exist():
+    if not all(os.path.exists(p) for p in [MODEL_SAVE_PATH, SCALER_SAVE_PATH, CSV_FILE_PATH]):
+        print("ERROR: Model/scaler/CSV files not found. Please run previous steps successfully first.")
+        return False
+    return True
+
+def calculate_trade_parameters(last_row, predicted_price):
+    """
+    Calculates trade parameters and dynamically adjusts SL/TP based on volume.
+    This is called AFTER a prediction is made.
+    """
+    last_price = last_row['Close']
+    last_sma = last_row['SMA_50']
+    volume_short_sma = last_row['Volume_SMA_20']
+    volume_long_sma = last_row['Volume_SMA_50']
+    
+    direction = None
+    # Buy Signal Logic: Prediction is up AND price is above the 50-period trend line
+    if predicted_price > last_price and last_price > last_sma:
+        direction = 'buy'
+    # Sell Signal Logic: Prediction is down AND price is below the 50-period trend line
+    elif predicted_price < last_price and last_price < last_sma:
+        direction = 'sell'
+    else:
+        return None # Prediction does not align with the major trend
+
+    # --- Dynamic Risk Calculation based on Volume ---
+    risk_pips = RISK_PIPS_NORMAL_VOL
+    if volume_short_sma > (volume_long_sma * 1.5):
+        risk_pips = RISK_PIPS_HIGH_VOL
+    elif volume_short_sma < (volume_long_sma * 0.7):
+        risk_pips = RISK_PIPS_LOW_VOL
+
+    pip_value = 0.0001
+    sl_distance = risk_pips * pip_value
+    tp_distance = sl_distance * TP_SL_RATIO_PRED
+    entry_price = last_price
+    stop_loss = entry_price - sl_distance if direction == 'buy' else entry_price + sl_distance
+    take_profit = entry_price + tp_distance if direction == 'buy' else entry_price - tp_distance
+    
+    return {
+        "direction": direction,
+        "entry_price": round(entry_price, 5),
+        "take_profit": round(take_profit, 5),
+        "stop_loss": round(stop_loss, 5),
+        "predicted_price_raw": float(predicted_price),
+        "risk_pips": risk_pips,
+        "indicators": {
+            "rsi_14": round(last_row['RSI_14'], 2),
+            "sma_50": round(last_sma, 5),
+            "volume_sma_20": round(volume_short_sma, 2),
+            "volume_sma_50": round(volume_long_sma, 2)
+        }
+    }
+
+def run_live_simulation_and_log():
+    if not MONGO_URI:
+        print("ERROR: MONGO_URI is not set. Please paste your connection string.")
+        return
+    if not check_files_exist():
+        return
+
+    # --- Load Model, Scaler, and Prepare Data ---
+    try:
+        model = load_model(MODEL_SAVE_PATH)
+        scaler = joblib.load(SCALER_SAVE_PATH)
+        
+        df_full = pd.read_csv(CSV_FILE_PATH, names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'], header=None)
+        df_full['Timestamp'] = pd.to_datetime(df_full['Date'] + ' ' + df_full['Time'])
+        df_full.set_index('Timestamp', inplace=True)
+        df_full.ta.rsi(length=14, append=True)
+        df_full.ta.sma(length=50, append=True)
+        df_full.ta.sma(close=df_full['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
+        df_full.ta.sma(close=df_full['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
+        df_full.dropna(inplace=True)
+
+        print("Model, scaler, and full dataset loaded successfully.")
+    except Exception as e:
+        print(f"Error loading files or preparing data: {e}")
+        return
+
+    # --- Simulate Live Feed ---
+    print(f"\n--- Starting Live Simulation for the last {SIMULATION_CANDLES} candles ---")
+    simulation_df = df_full.tail(SIMULATION_CANDLES)
+    
+    for i in range(1, len(simulation_df)):
+        current_row = simulation_df.iloc[i]
+        previous_row = simulation_df.iloc[i-1]
+        
+        current_rsi = current_row['RSI_14']
+        previous_rsi = previous_row['RSI_14']
+        
+        trigger_type = None
+        # BUY TRIGGER: RSI crosses UP from the oversold line
+        if previous_rsi < OVERSOLD_LEVEL and current_rsi >= OVERSOLD_LEVEL:
+            trigger_type = 'buy'
+        # SELL TRIGGER: RSI crosses DOWN from the overbought line
+        elif previous_rsi > OVERBOUGHT_LEVEL and current_rsi <= OVERBOUGHT_LEVEL:
+            trigger_type = 'sell'
+            
+        if trigger_type:
+            print(f"\n[{current_row.name}] --- {trigger_type.upper()} TRIGGER DETECTED --- RSI: {current_rsi:.2f}")
+            
+            # --- Prepare sequence for prediction ---
+            start_index = i - SEQUENCE_LENGTH
+            end_index = i
+            if start_index < 0:
+                continue # Not enough data for a full sequence
+            
+            input_sequence_df = simulation_df.iloc[start_index:end_index]
+            input_features = input_sequence_df[['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']]
+            scaled_input = scaler.transform(input_features)
+            reshaped_input = np.reshape(scaled_input, (1, SEQUENCE_LENGTH, input_features.shape[1]))
+
+            # --- Make Prediction ---
+            print(f"[{current_row.name}] Running LSTM model prediction...")
+            prediction_scaled = model.predict(reshaped_input)
+            dummy_array = np.zeros((1, input_features.shape[1]))
+            dummy_array[0, TARGET_COLUMN_INDEX] = prediction_scaled[0, 0]
+            predicted_price = scaler.inverse_transform(dummy_array)[0, TARGET_COLUMN_INDEX]
+
+            # --- Check Signal Logic and Log to MongoDB ---
+            trade_params = calculate_trade_parameters(current_row, predicted_price)
+            
+            if trade_params:
+                print(f"[{current_row.name}] SUCCESS: Prediction aligns with trend. Logging signal to MongoDB.")
+                print(json.dumps(trade_params, indent=4))
+                
+                try:
+                    client = MongoClient(MONGO_URI)
+                    db = client.forex_signals_db
+                    signals_collection = db.signals
+                    signal_doc = {
+                        "symbol": "EURUSD",
+                        "timestamp": current_row.name.to_pydatetime().replace(tzinfo=timezone.utc),
+                        "status": "active",
+                        "trigger_type": trigger_type,
+                        **trade_params, # Unpack the trade params dictionary
+                        "source": "colab_notebook_v4_rsi_trigger"
+                    }
+                    signals_collection.insert_one(signal_doc)
+                    client.close()
+                except Exception as e:
+                    print(f"[{current_row.name}] MONGO ERROR: {e}")
+            else:
+                print(f"[{current_row.name}] INFO: Prediction did not align with trend. Signal rejected.")
+
+    print("\n--- Simulation Complete ---")
+
+# Run the live simulation and logging process
+run_live_simulation_and_log()
+

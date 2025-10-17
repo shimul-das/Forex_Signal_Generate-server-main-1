@@ -1,0 +1,235 @@
+#@title 1. Setup and Installations
+#@markdown Run this cell first to install the necessary libraries for the project.
+!pip install pymongo[srv] tensorflow scikit-learn joblib pandas
+
+#@markdown ---
+#@markdown After this cell runs, you **must upload your historical data file**.
+#@markdown 1. Click the **folder icon** on the left sidebar.
+#@markdown 2. Click the **"Upload to session storage"** button.
+#@markdown 3. Select and upload your `EURUSD_1_minute_1M.csv` file. 
+
+print("\nSetup complete. Please upload your CSV file now.")
+
+
+#@title 2. Train the LSTM Model
+#@markdown This cell contains the complete logic for loading your data,
+#@markdown preprocessing it, building, and training the LSTM model.
+#@markdown
+#@markdown This process will take a significant amount of time.
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+import joblib
+import os
+
+# --- Configuration ---
+CSV_FILE_PATH = 'EURUSD_1_minute_1M.csv'
+MODEL_SAVE_PATH = 'eurusd_model.h5'
+SCALER_SAVE_PATH = 'scaler.pkl'
+SEQUENCE_LENGTH = 60
+TARGET_COLUMN = 'Close'
+
+def train_forex_model():
+    """
+    Orchestrates the entire model training pipeline.
+    """
+    if not os.path.exists(CSV_FILE_PATH):
+        print("="*50)
+        print(f"FATAL ERROR: The data file '{CSV_FILE_PATH}' was not found.")
+        print("Please make sure you have uploaded it before running this cell.")
+        print("="*50)
+        return
+
+    # --- Load and Preprocess Data ---
+    print("Loading data...")
+    try:
+        df = pd.read_csv(
+            CSV_FILE_PATH,
+            names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'],
+            header=None
+        )
+        print("Data loaded successfully.")
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+
+    df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+    df.set_index('Timestamp', inplace=True)
+    df.drop(['Date', 'Time', 'Volume'], axis=1, inplace=True)
+    df.sort_index(inplace=True)
+    data = df[[TARGET_COLUMN]].copy()
+
+    # --- Scaling Data ---
+    print("Scaling data...")
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data)
+    joblib.dump(scaler, SCALER_SAVE_PATH)
+    print(f"Scaler saved to '{SCALER_SAVE_PATH}'")
+
+    # --- Create Sequences ---
+    print("Creating sequences...")
+    X, y = [], []
+    for i in range(SEQUENCE_LENGTH, len(scaled_data)):
+        X.append(scaled_data[i-SEQUENCE_LENGTH:i, 0])
+        y.append(scaled_data[i, 0])
+    X, y = np.array(X), np.array(y)
+    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+
+    # --- Split Data ---
+    split_index = int(len(X) * 0.95)
+    X_train, X_test = X[:split_index], X[split_index:]
+    y_train, y_test = y[:split_index], y[split_index:]
+    print(f"Training data shape: {X_train.shape}")
+
+    # --- Build Model ---
+    print("Building LSTM model...")
+    model = Sequential([
+        LSTM(units=100, return_sequences=True, input_shape=(X_train.shape[1], 1)),
+        Dropout(0.2),
+        LSTM(units=100, return_sequences=False),
+        Dropout(0.2),
+        Dense(units=25),
+        Dense(units=1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.summary()
+
+    # --- Train Model ---
+    print("\nStarting model training...")
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model_checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, save_best_only=True, monitor='val_loss')
+
+    model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=64,
+        validation_data=(X_test, y_test),
+        callbacks=[early_stopping, model_checkpoint]
+    )
+
+    print("\n--- Training Complete ---")
+    print(f"Model saved to '{MODEL_SAVE_PATH}'")
+    print(f"Scaler saved to '{SCALER_SAVE_PATH}'")
+    print("You can now proceed to the next step.")
+
+# Run the training process
+train_forex_model()
+
+
+#@title 3. Predict and Send Signal to MongoDB
+#@markdown This final cell will:
+#@markdown 1. Load the model and scaler you just created.
+#@markdown 2. Generate a prediction using mock data.
+#@markdown 3. Connect to your MongoDB database.
+#@markdown 4. Save the trade signal as a new document.
+#@markdown
+#@markdown **Action Required:** You must paste your MongoDB Connection String (URI) below.
+
+from pymongo import MongoClient
+from datetime import datetime, timezone
+
+# --- PASTE YOUR MONGODB URI HERE ---
+# It should look like: "mongodb+srv://<user>:<password>@cluster..."
+MONGO_URI = "" # IMPORTANT: Replace with your actual connection string
+
+# --- Configuration ---
+TP_SL_RATIO_PRED = 2.0
+RISK_AMOUNT_PIPS_PRED = 10
+
+def check_files_exist():
+    if not all(os.path.exists(p) for p in [MODEL_SAVE_PATH, SCALER_SAVE_PATH]):
+        print("ERROR: Model/scaler files not found. Please run Step 2 successfully first.")
+        return False
+    return True
+
+def calculate_trade_parameters(last_price, predicted_price):
+    pip_value = 0.0001
+    sl_distance = RISK_AMOUNT_PIPS_PRED * pip_value
+    tp_distance = sl_distance * TP_SL_RATIO_PRED
+    direction = 'buy' if predicted_price > last_price else 'sell'
+    entry_price = last_price
+    stop_loss = entry_price - sl_distance if direction == 'buy' else entry_price + sl_distance
+    take_profit = entry_price + tp_distance if direction == 'buy' else entry_price - tp_distance
+    return {
+        "direction": direction,
+        "entry_price": round(entry_price, 5),
+        "take_profit": round(take_profit, 5),
+        "stop_loss": round(stop_loss, 5),
+        "predicted_price_raw": float(predicted_price)
+    }
+
+def run_prediction_and_log():
+    """
+    Main function to make a prediction and log it to MongoDB.
+    """
+    if not MONGO_URI:
+        print("ERROR: MONGO_URI is not set. Please paste your connection string.")
+        return
+
+    if not check_files_exist():
+        return
+
+    # --- Load Model and Scaler ---
+    try:
+        model = load_model(MODEL_SAVE_PATH)
+        scaler = joblib.load(SCALER_SAVE_PATH)
+        print("Model and scaler loaded successfully.")
+    except Exception as e:
+        print(f"Error loading files: {e}")
+        return
+
+    # --- Prepare Mock Data ---
+    print(f"Using mock data for {SEQUENCE_LENGTH} candles to run prediction.")
+    mock_candles = [1.07500 + (np.random.rand() - 0.5) * 0.001 for _ in range(SEQUENCE_LENGTH)]
+    last_close_price = mock_candles[-1]
+    input_data = np.array(mock_candles).reshape(-1, 1)
+    scaled_input = scaler.transform(input_data)
+    reshaped_input = np.reshape(scaled_input, (1, SEQUENCE_LENGTH, 1))
+
+    # --- Make Prediction ---
+    print("Making prediction...")
+    prediction_scaled = model.predict(reshaped_input)
+    predicted_price = scaler.inverse_transform(prediction_scaled)[0][0]
+    trade_params = calculate_trade_parameters(last_close_price, predicted_price)
+
+    print("\n--- Prediction Result ---")
+    print(json.dumps(trade_params, indent=4))
+    print("-------------------------")
+
+    # --- Connect to MongoDB and Log Signal ---
+    try:
+        print("\nConnecting to MongoDB...")
+        client = MongoClient(MONGO_URI)
+        db = client.forex_signals_db
+        signals_collection = db.signals
+        
+        signal_doc = {
+            "symbol": "EURUSD",
+            "timestamp": datetime.now(timezone.utc),
+            "status": "active",
+            "prediction_direction": trade_params["direction"],
+            "entry_price": trade_params["entry_price"],
+            "take_profit": trade_params["take_profit"],
+            "stop_loss": trade_params["stop_loss"],
+            "predicted_price": trade_params["predicted_price_raw"],
+            "source": "colab_notebook"
+        }
+        
+        insert_result = signals_collection.insert_one(signal_doc)
+        print("Successfully connected to MongoDB.")
+        print(f"Signal logged with document ID: {insert_result.inserted_id}")
+
+    except Exception as e:
+        print(f"An error occurred with MongoDB: {e}")
+    finally:
+        if 'client' in locals():
+            client.close()
+            print("MongoDB connection closed.")
+
+
+# Run the prediction and logging process
+run_prediction_and_log()
