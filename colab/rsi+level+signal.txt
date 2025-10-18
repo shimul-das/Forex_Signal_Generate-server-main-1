@@ -467,182 +467,241 @@ def train_forex_model():
 train_forex_model()
 
 
-#@title 3. Simulate Live Trading with RSI Triggers and Send Signals
-#@markdown This final cell simulates a live trading environment. It will:
-#@markdown 1. Loop through historical data as if it were a live feed.
-#@markdown 2. Wait for the RSI to cross above 30 (buy trigger) or below 70 (sell trigger).
-#@markdown 3. On a trigger, run the LSTM prediction.
-#@markdown 4. If the prediction aligns with trend and volume rules, log it to MongoDB.
+#@title 3. Live Signal Generation Bot
+#@markdown This script connects to the live data feed, listens for ticks,
+#@markdown builds candles in real-time, and generates signals based on the trained model and TA rules.
 #@markdown
-#@markdown **Action Required:** You must paste your MongoDB Connection String (URI) below.
+#@markdown **Action Required:**
+#@markdown 1. Ensure `eurusd_model.h5` and `scaler.pkl` are in the same directory.
+#@markdown 2. Paste your MongoDB Connection String (URI) below.
+#@markdown 3. Run this script from your local machine or a server, not Colab.
 
-import json
-from pymongo import MongoClient
-from datetime import datetime, timezone
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import joblib
 from tensorflow.keras.models import load_model
+from pymongo import MongoClient
+import socketio
+from datetime import datetime, timezone, timedelta
+import time
+import os
 
-# --- PASTE YOUR MONGODB URI HERE ---
-# It should look like: "mongodb+srv://<user>:<password>@cluster..."
-MONGO_URI = "" # IMPORTANT: Replace with your actual connection string
+# --- Configuration ---
+MODEL_SAVE_PATH = 'eurusd_model.h5'
+SCALER_SAVE_PATH = 'scaler.pkl'
+# This is the same server your React frontend connects to
+SOCKET_SERVER_URL = "https://forex-signal-generate-server-main.vercel.app"
+MONGO_URI = "mongodb+srv://Boss1321:75EkdyAFEmOh6uVb@cluster0.6g3butq.mongodb.net/Forex_realtime_DB"
 
-# --- Configuration for Triggers and Dynamic TP/SL ---
+# --- Trading Logic Configuration ---
+SEQUENCE_LENGTH = 60
 OVERSOLD_LEVEL = 30
 OVERBOUGHT_LEVEL = 70
 TP_SL_RATIO_PRED = 2.0
 RISK_PIPS_LOW_VOL = 8
 RISK_PIPS_NORMAL_VOL = 12
 RISK_PIPS_HIGH_VOL = 18
-SIMULATION_CANDLES = 2000 # How many recent candles to simulate
+TARGET_COLUMN_INDEX = 0 # 'Close'
 
-def check_files_exist():
-    if not all(os.path.exists(p) for p in [MODEL_SAVE_PATH, SCALER_SAVE_PATH, CSV_FILE_PATH]):
-        print("ERROR: Model/scaler/CSV files not found. Please run previous steps successfully first.")
-        return False
-    return True
+# --- Global State Variables ---
+history_df = pd.DataFrame()
+current_candle = None
+model = None
+scaler = None
+
+# --- Socket.IO Client Setup ---
+sio = socketio.Client()
+
+@sio.event
+def connect():
+    print("✅ Successfully connected to the live data server.")
+
+@sio.event
+def connect_error(data):
+    print("❌ Connection failed!")
+
+@sio.event
+def disconnect():
+    print("🔌 Disconnected from the server.")
 
 def calculate_trade_parameters(last_row, predicted_price):
-    """
-    Calculates trade parameters and dynamically adjusts SL/TP based on volume.
-    This is called AFTER a prediction is made.
-    """
+    """Calculates final trade parameters after a prediction is made and validated."""
     last_price = last_row['Close']
     last_sma = last_row['SMA_50']
-    volume_short_sma = last_row['Volume_SMA_20']
-    volume_long_sma = last_row['Volume_SMA_50']
-    
+    volume_short_sma = last_row.get('Volume_SMA_20', 0) # Use .get for safety
+    volume_long_sma = last_row.get('Volume_SMA_50', 0)
+
     direction = None
-    # Buy Signal Logic: Prediction is up AND price is above the 50-period trend line
     if predicted_price > last_price and last_price > last_sma:
         direction = 'buy'
-    # Sell Signal Logic: Prediction is down AND price is below the 50-period trend line
     elif predicted_price < last_price and last_price < last_sma:
         direction = 'sell'
     else:
-        return None # Prediction does not align with the major trend
+        return None # Prediction doesn't align with trend
 
-    # --- Dynamic Risk Calculation based on Volume ---
     risk_pips = RISK_PIPS_NORMAL_VOL
-    if volume_short_sma > (volume_long_sma * 1.5):
-        risk_pips = RISK_PIPS_HIGH_VOL
-    elif volume_short_sma < (volume_long_sma * 0.7):
-        risk_pips = RISK_PIPS_LOW_VOL
-
+    if volume_long_sma > 0: # Avoid division by zero
+        if volume_short_sma > (volume_long_sma * 1.5):
+            risk_pips = RISK_PIPS_HIGH_VOL
+        elif volume_short_sma < (volume_long_sma * 0.7):
+            risk_pips = RISK_PIPS_LOW_VOL
+    
     pip_value = 0.0001
     sl_distance = risk_pips * pip_value
     tp_distance = sl_distance * TP_SL_RATIO_PRED
-    entry_price = last_price
-    stop_loss = entry_price - sl_distance if direction == 'buy' else entry_price + sl_distance
-    take_profit = entry_price + tp_distance if direction == 'buy' else entry_price - tp_distance
     
     return {
-        "direction": direction,
-        "entry_price": round(entry_price, 5),
-        "take_profit": round(take_profit, 5),
-        "stop_loss": round(stop_loss, 5),
-        "predicted_price_raw": float(predicted_price),
-        "risk_pips": risk_pips,
+        "direction": direction, "entry_price": round(last_price, 5),
+        "take_profit": round(last_price + tp_distance if direction == 'buy' else last_price - tp_distance, 5),
+        "stop_loss": round(last_price - sl_distance if direction == 'buy' else last_price + sl_distance, 5),
+        "predicted_price_raw": float(predicted_price), "risk_pips": risk_pips,
         "indicators": {
-            "rsi_14": round(last_row['RSI_14'], 2),
-            "sma_50": round(last_sma, 5),
-            "volume_sma_20": round(volume_short_sma, 2),
-            "volume_sma_50": round(volume_long_sma, 2)
+            "rsi_14": round(last_row['RSI_14'], 2), "sma_50": round(last_sma, 5),
+            "volume_sma_20": round(volume_short_sma, 2), "volume_sma_50": round(volume_long_sma, 2)
         }
     }
 
-def run_live_simulation_and_log():
-    if not MONGO_URI:
-        print("ERROR: MONGO_URI is not set. Please paste your connection string.")
-        return
-    if not check_files_exist():
-        return
-
-    # --- Load Model, Scaler, and Prepare Data ---
-    try:
-        model = load_model(MODEL_SAVE_PATH)
-        scaler = joblib.load(SCALER_SAVE_PATH)
-        
-        df_full = pd.read_csv(CSV_FILE_PATH, names=['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume'], header=None)
-        df_full['Timestamp'] = pd.to_datetime(df_full['Date'] + ' ' + df_full['Time'])
-        df_full.set_index('Timestamp', inplace=True)
-        df_full.ta.rsi(length=14, append=True)
-        df_full.ta.sma(length=50, append=True)
-        df_full.ta.sma(close=df_full['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
-        df_full.ta.sma(close=df_full['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
-        df_full.dropna(inplace=True)
-
-        print("Model, scaler, and full dataset loaded successfully.")
-    except Exception as e:
-        print(f"Error loading files or preparing data: {e}")
-        return
-
-    # --- Simulate Live Feed ---
-    print(f"\n--- Starting Live Simulation for the last {SIMULATION_CANDLES} candles ---")
-    simulation_df = df_full.tail(SIMULATION_CANDLES)
+def process_prediction():
+    """Takes the current history, runs the model, and logs any valid signals."""
+    global history_df, model, scaler
     
-    for i in range(1, len(simulation_df)):
-        current_row = simulation_df.iloc[i]
-        previous_row = simulation_df.iloc[i-1]
+    # Ensure we have enough data
+    if len(history_df) < SEQUENCE_LENGTH:
+        print("INFO: Not enough historical data yet to make a prediction.")
+        return
+
+    # Prepare the input sequence for the model
+    last_sequence = history_df.tail(SEQUENCE_LENGTH)
+    input_features = last_sequence[['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']]
+    scaled_input = scaler.transform(input_features)
+    reshaped_input = np.reshape(scaled_input, (1, SEQUENCE_LENGTH, input_features.shape[1]))
+
+    # --- Make Prediction ---
+    print("🧠 Running LSTM model prediction...")
+    prediction_scaled = model.predict(reshaped_input)
+    dummy_array = np.zeros((1, input_features.shape[1]))
+    dummy_array[0, TARGET_COLUMN_INDEX] = prediction_scaled[0, 0]
+    predicted_price = scaler.inverse_transform(dummy_array)[0, TARGET_COLUMN_INDEX]
+
+    # --- Check Signal Logic and Log to MongoDB ---
+    trade_params = calculate_trade_parameters(history_df.iloc[-1], predicted_price)
+    
+    if trade_params:
+        print(f"✅ SUCCESS: Prediction aligns with trend. Logging signal to MongoDB.")
+        print(json.dumps(trade_params, indent=2))
+        try:
+            client = MongoClient(MONGO_URI)
+            db = client.forex_signals_db
+            signals_collection = db.signals
+            signal_doc = {
+                "symbol": "EURUSD", "status": "active",
+                "timestamp": datetime.now(timezone.utc),
+                **trade_params, "source": "live_python_bot_v5"
+            }
+            signals_collection.insert_one(signal_doc)
+            client.close()
+        except Exception as e:
+            print(f"❌ MONGO ERROR: {e}")
+    else:
+        print("INFO: Prediction did not align with trend rules. Signal rejected.")
+
+
+@sio.on('newTick')
+def on_new_tick(data):
+    """Main event handler for incoming live ticks."""
+    global current_candle, history_df
+    
+    price = (data['bid'] + data['ask']) / 2.0
+    tick_time = datetime.now(timezone.utc)
+    
+    # Floor the time to the current minute to manage candle creation
+    candle_timestamp = tick_time.replace(second=0, microsecond=0)
+
+    if current_candle is None:
+        # Start the very first candle
+        current_candle = {
+            'Timestamp': candle_timestamp, 'Open': price, 'High': price,
+            'Low': price, 'Close': price, 'Volume': 1
+        }
+        return
+
+    if candle_timestamp > current_candle['Timestamp']:
+        # --- A NEW CANDLE HAS FORMED ---
+        print(f"\n🕯️ New 1-minute candle closed at {current_candle['Timestamp']}")
         
-        current_rsi = current_row['RSI_14']
-        previous_rsi = previous_row['RSI_14']
+        # 1. Append the completed candle to our history
+        new_candle_df = pd.DataFrame([current_candle]).set_index('Timestamp')
+        history_df = pd.concat([history_df, new_candle_df])
         
-        trigger_type = None
-        # BUY TRIGGER: RSI crosses UP from the oversold line
-        if previous_rsi < OVERSOLD_LEVEL and current_rsi >= OVERSOLD_LEVEL:
-            trigger_type = 'buy'
-        # SELL TRIGGER: RSI crosses DOWN from the overbought line
-        elif previous_rsi > OVERBOUGHT_LEVEL and current_rsi <= OVERBOUGHT_LEVEL:
-            trigger_type = 'sell'
-            
-        if trigger_type:
-            print(f"\n[{current_row.name}] --- {trigger_type.upper()} TRIGGER DETECTED --- RSI: {current_rsi:.2f}")
-            
-            # --- Prepare sequence for prediction ---
-            start_index = i - SEQUENCE_LENGTH
-            end_index = i
-            if start_index < 0:
-                continue # Not enough data for a full sequence
-            
-            input_sequence_df = simulation_df.iloc[start_index:end_index]
-            input_features = input_sequence_df[['Close', 'RSI_14', 'SMA_50', 'Volume_SMA_20']]
-            scaled_input = scaler.transform(input_features)
-            reshaped_input = np.reshape(scaled_input, (1, SEQUENCE_LENGTH, input_features.shape[1]))
+        # 2. Keep the history from growing indefinitely
+        history_df = history_df.tail(500) 
+        
+        # 3. Recalculate indicators on the updated history
+        history_df.ta.rsi(length=14, append=True)
+        history_df.ta.sma(length=50, append=True)
+        history_df.ta.sma(close=history_df['Volume'], length=20, append=True, col_names=('Volume_SMA_20',))
+        history_df.ta.sma(close=history_df['Volume'], length=50, append=True, col_names=('Volume_SMA_50',))
+        history_df.dropna(inplace=True)
 
-            # --- Make Prediction ---
-            print(f"[{current_row.name}] Running LSTM model prediction...")
-            prediction_scaled = model.predict(reshaped_input)
-            dummy_array = np.zeros((1, input_features.shape[1]))
-            dummy_array[0, TARGET_COLUMN_INDEX] = prediction_scaled[0, 0]
-            predicted_price = scaler.inverse_transform(dummy_array)[0, TARGET_COLUMN_INDEX]
-
-            # --- Check Signal Logic and Log to MongoDB ---
-            trade_params = calculate_trade_parameters(current_row, predicted_price)
+        # 4. Check for RSI trigger conditions
+        if len(history_df) > 1:
+            last_row = history_df.iloc[-1]
+            prev_row = history_df.iloc[-2]
             
-            if trade_params:
-                print(f"[{current_row.name}] SUCCESS: Prediction aligns with trend. Logging signal to MongoDB.")
-                print(json.dumps(trade_params, indent=4))
-                
-                try:
-                    client = MongoClient(MONGO_URI)
-                    db = client.forex_signals_db
-                    signals_collection = db.signals
-                    signal_doc = {
-                        "symbol": "EURUSD",
-                        "timestamp": current_row.name.to_pydatetime().replace(tzinfo=timezone.utc),
-                        "status": "active",
-                        "trigger_type": trigger_type,
-                        **trade_params, # Unpack the trade params dictionary
-                        "source": "colab_notebook_v4_rsi_trigger"
-                    }
-                    signals_collection.insert_one(signal_doc)
-                    client.close()
-                except Exception as e:
-                    print(f"[{current_row.name}] MONGO ERROR: {e}")
-            else:
-                print(f"[{current_row.name}] INFO: Prediction did not align with trend. Signal rejected.")
+            trigger_type = None
+            if prev_row['RSI_14'] < OVERSOLD_LEVEL and last_row['RSI_14'] >= OVERSOLD_LEVEL:
+                trigger_type = 'buy'
+            elif prev_row['RSI_14'] > OVERBOUGHT_LEVEL and last_row['RSI_14'] <= OVERBOUGHT_LEVEL:
+                trigger_type = 'sell'
+            
+            if trigger_type:
+                print(f"🔥 {trigger_type.upper()} TRIGGER! RSI: {last_row['RSI_14']:.2f}. Checking model...")
+                process_prediction()
 
-    print("\n--- Simulation Complete ---")
+        # 5. Start the new candle for the current minute
+        current_candle = {
+            'Timestamp': candle_timestamp, 'Open': price, 'High': price,
+            'Low': price, 'Close': price, 'Volume': 1
+        }
+    else:
+        # --- Update the current, open candle ---
+        current_candle['High'] = max(current_candle['High'], price)
+        current_candle['Low'] = min(current_candle['Low'], price)
+        current_candle['Close'] = price
+        current_candle['Volume'] += 1
 
-# Run the live simulation and logging process
-run_live_simulation_and_log()
+def main():
+    """Initializes and runs the bot."""
+    global model, scaler, history_df
+    
+    if not all(os.path.exists(p) for p in [MODEL_SAVE_PATH, SCALER_SAVE_PATH]):
+        print("="*50)
+        print("FATAL ERROR: Model and/or scaler files not found.")
+        print("Please place `eurusd_model.h5` and `scaler.pkl` in this directory.")
+        print("="*50)
+        return
+        
+    print("--- Live Forex Signal Bot ---")
+    print("Loading model and scaler...")
+    # Load the trained model and scaler
+    model = load_model(MODEL_SAVE_PATH)
+    scaler = joblib.load(SCALER_SAVE_PATH)
+    print("✅ Model and scaler loaded.")
+
+    print("Connecting to server...")
+    try:
+        sio.connect(SOCKET_SERVER_URL)
+        sio.wait() # Keep the script running
+    except socketio.exceptions.ConnectionError as e:
+        print(f"❌ Could not connect to the server at {SOCKET_SERVER_URL}. Please check the server.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        if sio.sid:
+            sio.disconnect()
+
+if __name__ == '__main__':
+    main()
+
 
