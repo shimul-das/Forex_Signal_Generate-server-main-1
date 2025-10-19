@@ -1,39 +1,90 @@
 const express = require('express');
 const router = express.Router();
-const Signal = require('../models/Signal'); // Import the Mongoose model for signals
+const DirectSignal = require('../models/DirectSignal'); // Adjust path if needed
 
-// This endpoint is for MQL4 indicators to log signals directly without AI validation.
-router.get('/', async (req, res) => {
-    // 1. Destructure and validate incoming query parameters
-    const { symbol, rsi, cci, adx, body, direction } = req.query;
-    if (!symbol || !rsi || !cci || !adx || !body || !direction) {
-        console.error('Direct Log Aborted: Missing required query parameters.');
-        return res.status(400).send({ success: false, message: 'Missing parameters.' });
-    }
-
-    // 2. Asynchronously save the signal with the "DIRECT_MQL4" source
+// POST /api/direct-signal
+// Called by MQL4 to log a NEW, PENDING signal
+router.post('/', async (req, res) => {
     try {
-        const newSignal = new Signal({
-            symbol,
-            direction: direction.toUpperCase(),
-            source: 'DIRECT_MQL4', // Explicitly set the source
-            rsi: parseFloat(rsi),
-            cci: parseFloat(cci),
-            adx: parseFloat(adx),
-            body: parseFloat(body),
-            // 'isValidated' field is intentionally omitted
-        });
-        await newSignal.save();
-        console.log(`💾 Direct signal for ${symbol} (${direction}) successfully logged.`);
-        
-        // 3. Send a success response back to the MQL4 indicator
-        res.status(200).send({ success: true, message: 'Signal logged.' });
+        const {
+            mqlSignalId,
+            indicatorName,
+            pair,
+            timeframe,
+            direction,
+            entryTime, // MQL4 should send this as a UNIX timestamp (integer)
+            expirationTime // MQL4 should send this as a UNIX timestamp (integer)
+        } = req.body;
 
-    } catch (dbError) {
-        console.error("❌ Database Error: Failed to save direct signal:", dbError.message);
-        res.status(500).send({ success: false, message: 'Database error.' });
+        // Convert UNIX timestamps (in seconds) to JavaScript Date objects (in milliseconds)
+        const entryDate = new Date(entryTime * 1000);
+        const expirationDate = new Date(expirationTime * 1000);
+
+        const newSignal = new DirectSignal({
+            mqlSignalId,
+            indicatorName,
+            pair,
+            timeframe,
+            direction,
+            entryTime: entryDate,
+            expirationTime: expirationDate,
+            status: 'PENDING'
+        });
+
+        await newSignal.save();
+
+        // You could also emit this to socket.io clients here
+        // const io = req.app.get('socketio'); // See server.js update below
+        // io.emit('new_signal', newSignal);
+        
+        console.log('✅ [DirectSignal] Logged new signal:', mqlSignalId);
+        res.status(201).json({
+            message: "Signal logged successfully",
+            signal: newSignal
+        });
+
+    } catch (error) {
+        console.error('❌ [DirectSignal] Error logging signal:', error.message);
+        res.status(400).json({ error: error.message });
     }
 });
 
-module.exports = router;
+// PUT /api/direct-signal/update
+// Called by MQL4 (from OnTimer) to update the RESULT of a signal
+router.put('/update', async (req, res) => {
+    try {
+        const { mqlSignalId, status } = req.body; // status should be "WIN", "LOSS", or "DOJI"
 
+        if (!mqlSignalId || !status) {
+            return res.status(400).json({ error: 'mqlSignalId and status are required.' });
+        }
+
+        const updatedSignal = await DirectSignal.findOneAndUpdate(
+            { mqlSignalId: mqlSignalId }, // Find by our custom MQL ID
+            { $set: { status: status } },
+            { new: true } // Return the updated document
+        );
+
+        if (!updatedSignal) {
+            console.warn('⚠️ [DirectSignal] Signal to update not found:', mqlSignalId);
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+
+        // You could also emit this to socket.io clients here
+        // const io = req.app.get('socketio');
+        // io.emit('signal_update', updatedSignal);
+
+        console.log('✅ [DirectSignal] Updated signal:', mqlSignalId, 'to', status);
+        res.status(200).json({
+            message: "Signal updated successfully",
+            signal: updatedSignal
+        });
+
+    } catch (error) {
+        console.error('❌ [DirectSignal] Error updating signal:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+
+module.exports = router;
